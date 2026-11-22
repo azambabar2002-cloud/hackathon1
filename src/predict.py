@@ -14,10 +14,17 @@ def _load():
     return _bundle
 
 
-def predict_risk(X: pd.DataFrame):
+def predict_batch(X: pd.DataFrame):
+    """Predict many rows at once. Returns (tiers array, probabilities DataFrame Low->Critical)."""
     b = _load()
     m = b["model"]
-    X = X[b["features"]]                            # exact training column order
-    tier = m.predict(X)[0]
-    proba = pd.DataFrame(m.predict_proba(X), columns=m.classes_)[b["labels"]].iloc[0]
-    return tier, proba                              # proba ordered Low->Critical
+    X = X[b["features"]].astype(float)              # exact training column order
+    tiers = m.predict(X)
+    proba = pd.DataFrame(m.predict_proba(X), columns=m.classes_)[b["labels"]]
+    return tiers, proba
+
+
+def predict_risk(X: pd.DataFrame):
+    """Single-row convenience wrapper."""
+    tiers, proba = predict_batch(X)
+    return tiers[0], proba.iloc[0]
