@@ -11,6 +11,7 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+from src import ui
 
 from src.allocation import BANDS, CREWS_BY_TIER, ROUND_SHARE, W_CASES, W_DENSITY, build_ward_demand, run_allocation
 from src.dispatch import brief_html, brief_pdf, build_notices, city_summary, phone_links, split_sms
@@ -22,6 +23,7 @@ from src.predict import forecast_weeks
 from src.weather import fetch_daily_weather
 
 st.set_page_config(page_title="Dengue Early Warning", page_icon="🦟", layout="wide")
+ui.inject_theme()
 
 # ----------------------------------------------------------------------------- constants
 LABELS = ["Low", "Medium", "High", "Critical"]
@@ -164,12 +166,7 @@ if rec_on:                                          # recorded mode: the officer
     today = date.fromisoformat(st.session_state.get("rec_date", "2025-08-25"))
 end_day = today + timedelta(days=27)
 
-st.image(str(ROOT / "assets" / "banner.png"), width="stretch")
-st.markdown('<p class="hero-title">Dengue Outbreak Early Warning</p>', unsafe_allow_html=True)
-st.markdown(
-    '<p class="hero-sub">A week-by-week dengue forecast for the next 4 weeks, with the supplies each ward will need.</p>',
-    unsafe_allow_html=True,
-)
+ui.hero(compact=bool(st.session_state.get("checked")))
 
 # ----------------------------------------------------------------------------- sidebar inputs
 with st.sidebar:
@@ -203,8 +200,7 @@ checked = st.session_state.get("checked")
 
 # ----------------------------------------------------------------------------- landing screen
 if not checked:
-    st.info("👈 Pick a city and ward in the sidebar, then press **Check dengue risk**.")
-    st.image(str(ROOT / "assets" / "breeding_clock.png"), width="stretch")
+   
     c1, c2, c3 = st.columns(3)
     c1.markdown('<div class="step-card"><h4><span class="step-num">1</span>Choose</h4>'
                 "Select a city corporation and a ward. The date is set to today.</div>", unsafe_allow_html=True)
@@ -214,6 +210,9 @@ if not checked:
     c3.markdown('<div class="step-card"><h4><span class="step-num">3</span>Get a 4-week plan</h4>'
                 "You see the expected cases, risk tier and supplies for each of the next 4 weeks, what drives them, "
                 "and what to do.</div>", unsafe_allow_html=True)
+    st.write("")
+    with st.expander("Why rain turns into dengue cases weeks later"):
+        st.image(str(ROOT / "assets" / "breeding_clock.png"), width="stretch")
     st.stop()
 
 # ----------------------------------------------------------------------------- results
@@ -233,10 +232,9 @@ pk = wf.loc[wf["predicted_cases"].idxmax()]                       # the peak wee
 peak_tier = max(wf["risk"], key=RANK.get)
 peak_week = int(wf.loc[wf["risk"].map(RANK).idxmax(), "week"])
 x = X_all.loc[[int(wf["row"].iloc[0])]]
-
-tab_risk, tab_drivers, tab_map, tab_alloc, tab_beds, tab_dispatch, tab_sim, tab_about = st.tabs(
-    ["🎯 4-week forecast and actions", "🌧️ Weather drivers", "🗺️ Ward map", "📦 Supply allocation",
-     "🏥 Bed overflow", "📨 Dispatch notices", "🦟 What-if: vector control", "ℹ️ How it works"]
+tab_risk, tab_city, tab_drivers, tab_map, tab_alloc, tab_beds, tab_dispatch, tab_sim, tab_about = st.tabs(
+    ["🎯 4-week forecast and actions", "🏙️ City overview", "🌧️ Weather drivers", "🗺️ Ward map",
+     "📦 Supply allocation", "🏥 Bed overflow", "📨 Dispatch notices", "🦟 What-if: vector control", "ℹ️ How it works"]
 )
 
 # ---- Tab 1: weekly forecast + supplies + actions
@@ -294,7 +292,8 @@ with tab_risk:
     if peak_tier in ("High", "Critical"):
         st.markdown(f'<div class="note-box">⚠️ The highest risk arrives in week {peak_week}. Act now: transmission chains '
                     "start weeks before hospital admissions rise.</div>", unsafe_allow_html=True)
-
+with tab_city:
+    ui.city_overview(fc, c_city, LABELS, COLORS, TIER_RANGE)
 # ---- Tab 2: weather drivers
 with tab_drivers:
     st.subheader("What the weather has been doing")
