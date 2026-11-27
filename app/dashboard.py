@@ -13,6 +13,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from src.allocation import BANDS, CREWS_BY_TIER, ROUND_SHARE, W_CASES, W_DENSITY, build_ward_demand, run_allocation
+from src.dispatch import brief_html, brief_pdf, build_notices, city_summary, phone_links, split_sms
 from src.explain import driver_breakdown
 from src.overflow import BEDS_PER_10K, plan_overflow
 from src.simulate import EFFECT_PER_CREW_DAY, MAX_CREWS_PER_WARD, auto_deploy, run as run_whatif, ward_curves
@@ -233,8 +234,9 @@ peak_tier = max(wf["risk"], key=RANK.get)
 peak_week = int(wf.loc[wf["risk"].map(RANK).idxmax(), "week"])
 x = X_all.loc[[int(wf["row"].iloc[0])]]
 
-tab_risk, tab_drivers, tab_map, tab_alloc, tab_beds, tab_sim, tab_about = st.tabs(
-    ["🎯 4-week forecast and actions", "🌧️ Weather drivers", "🗺️ Ward map", "📦 Supply allocation", "🏥 Bed overflow", "🦟 What-if: vector control", "ℹ️ How it works"]
+tab_risk, tab_drivers, tab_map, tab_alloc, tab_beds, tab_dispatch, tab_sim, tab_about = st.tabs(
+    ["🎯 4-week forecast and actions", "🌧️ Weather drivers", "🗺️ Ward map", "📦 Supply allocation",
+     "🏥 Bed overflow", "📨 Dispatch notices", "🦟 What-if: vector control", "ℹ️ How it works"]
 )
 
 # ---- Tab 1: weekly forecast + supplies + actions
@@ -526,7 +528,75 @@ with tab_beds:
 - **Same city only.** If the whole city is full, the tool reports a city-wide shortage instead of hiding it.
 - The tool suggests; the officer decides and calls the hospitals. No patient data is used.""")
 
-# ---- Tab 6: what-if vector control simulator
+# ---- Tab 6: dispatch notices (SMS / WhatsApp text, HTML and PDF commissioner brief). Fully offline.
+# Reuses what the earlier tabs built: res + sm (allocation), rt (overflow routes), d1 + d2 (forecast week dates).
+with tab_dispatch:
+    st.subheader(f"Dispatch notices for {c_city}")
+    st.caption(f"Forecast week {d1:%d %b} to {d2:%d %b}. Built from the Supply allocation and Bed overflow tabs with fixed "
+               "templates. No internet and no AI service are used, so this works offline.")
+
+    notices = build_notices(res, c_city, d1, d2)
+    if notices.empty:
+        st.success("No ward has demand next week, so there is nothing to dispatch.")
+    else:
+        only = st.checkbox("Only wards with a shortfall or High/Critical risk", value=True, key="disp_only")
+        view = notices[(notices["band"] > 0) | notices["risk"].isin(["High", "Critical"])] if only else notices
+        if view.empty:
+            view = notices
+        wards_list = [int(w) for w in view["ward_no"]]
+        pick = st.selectbox("Ward", wards_list, index=wards_list.index(c_ward) if c_ward in wards_list else 0,
+                            format_func=lambda w: f"Ward {w}", key="disp_ward")
+        n = notices[notices["ward_no"] == pick].iloc[0]
+
+        colA, colB = st.columns(2)
+        with colA:
+            st.markdown("**📱 SMS (plain text)**")
+            parts = split_sms(n["sms"])
+            for p in parts:
+                st.code(p, language=None)                       # st.code has a built-in copy button
+            st.caption(f"{len(parts)} message(s), {sum(len(p) for p in parts)} characters")
+        with colB:
+            st.markdown("**💬 WhatsApp**")
+            st.code(n["whatsapp"], language=None)
+
+        lk_sms, lk_wa = phone_links(n["sms"])["sms"], phone_links(n["whatsapp"])["whatsapp"]
+        st.markdown(f"[📱 Open in the phone's SMS app]({lk_sms}) &nbsp;|&nbsp; [💬 Open in WhatsApp]({lk_wa})")
+        st.caption("These links only open the officer's own phone app with the text filled in. Sending needs that phone to have "
+                   "signal. This tool prepares the message; it does not send it.")
+
+        st.markdown("**All wards**")
+        st.dataframe(notices[["rank", "ward_no", "risk", "cases", "saline", "kits", "crews", "beds", "status"]]
+                     .rename(columns={"rank": "Priority", "ward_no": "Ward", "risk": "Risk", "cases": "Cases",
+                                      "saline": "Saline (given/need)", "kits": "Kits (given/need)",
+                                      "crews": "Crews (assigned/need)", "beds": "Beds", "status": "Status"})
+                     .assign(Cases=lambda d: d["Cases"].round(1)),
+                     hide_index=True, width="stretch")
+
+        st.divider()
+        all_txt = "\n\n".join(f"===== Ward {r.ward_no} =====\nSMS:\n{r.sms}\n\nWHATSAPP:\n{r.whatsapp}"
+                              for r in notices.itertuples())
+        brief = brief_html(notices, city_summary(res, sm), rt, c_city, d1, d2)
+        x1, x2, x3 = st.columns(3)
+        x1.download_button("⬇️ All notices (TXT)", all_txt.encode("utf-8"),
+                           file_name=f"dispatch_notices_{c_city}_{d1}.txt", mime="text/plain")
+        x2.download_button("⬇️ Commissioner brief (HTML)", brief.encode("utf-8"),
+                           file_name=f"commissioner_brief_{c_city}_{d1}.html", mime="text/html")
+        try:
+            pdf_bytes = brief_pdf(notices, city_summary(res, sm), rt, c_city, d1, d2)
+            x3.download_button("⬇️ Commissioner brief (PDF)", pdf_bytes,
+                               file_name=f"commissioner_brief_{c_city}_{d1}.pdf", mime="application/pdf")
+        except ImportError:
+            x3.info("PDF needs reportlab: run `pip install reportlab`. The HTML brief can be printed to PDF from any browser.")
+
+        with st.expander("How the notices are made"):
+            st.markdown("""
+- Every number comes from the forecast, the allocation and the bed-overflow tabs. Nothing is typed by hand.
+- The text is filled into a fixed template, so the same input always gives the same notice (deterministic, no AI model needed).
+- **SMS** uses plain characters and is split into 160-character parts. **WhatsApp** uses a longer message with bold text.
+- **Deficit alert** appears when a ward's need is not fully met. The band follows the allocation tab (minor, serious, critical).
+- The **commissioner brief** lists city totals, deficit alerts, the ward table and bed overflow routes, and prints from any browser.""")
+
+# ---- Tab 7: what-if vector control simulator
 with tab_sim:
     st.subheader(f"What-if: send spraying crews in {c_city}")
     st.caption("Choose how many crews work, for how many days, and where. The forecast model is re-run for each ward with fewer "
@@ -622,7 +692,7 @@ with tab_sim:
   time where the next crew prevents the most cases.
 - Results are model estimates for planning, not guarantees.""")
 
-# ---- Tab 7: about
+# ---- Tab 8: about
 with tab_about:
     st.image(str(ROOT / "assets" / "breeding_clock.png"), width="stretch")
     st.markdown(
@@ -638,6 +708,7 @@ with tab_about:
 - **Risk tiers, per week:** **Low** (0-1 cases), **Medium** (2-6), **High** (7-11), **Critical** (12 or more).
 - **Supplies.** Each week's expected cases are converted to saline bags, test kits and beds using the dataset's own
   cases-to-supplies table.
+- **Dispatch notices.** Ward-level SMS and WhatsApp text and a printable commissioner brief are filled from fixed templates, offline.
 - **Honest limits.** Later weeks are harder to predict because part of the rain that drives them has not fallen yet.
 - **Efficiency.** One weather request per city per day (cached), models loaded once, no paid or AI-token API at runtime.
 """
