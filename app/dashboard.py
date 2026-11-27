@@ -12,7 +12,10 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
+from src.allocation import BANDS, CREWS_BY_TIER, ROUND_SHARE, W_CASES, W_DENSITY, build_ward_demand, run_allocation
 from src.explain import driver_breakdown
+from src.overflow import BEDS_PER_10K, plan_overflow
+from src.simulate import EFFECT_PER_CREW_DAY, MAX_CREWS_PER_WARD, auto_deploy, run as run_whatif, ward_curves
 from src.features import build_features
 from src.predict import forecast_weeks
 from src.weather import fetch_daily_weather
@@ -103,14 +106,31 @@ def load_wards():
     return w
 
 
+@st.cache_data
+def load_recorded():
+    return pd.read_csv(ROOT / "data" / "recorded_2025.csv", parse_dates=["date"])
+
+
+def recorded_starts():
+    """Forecast start dates available from the recorded data: the Monday after each recorded weather week."""
+    return sorted((d + pd.Timedelta(days=7)).date().isoformat() for d in load_recorded()["date"].unique())
+
+
 @st.cache_data(show_spinner=False, ttl=1800)
 def city_forecast(city: str, today_iso: str):
     """One weather request per city (city centre); every ward is forecast with its own fixed features."""
     cw = load_wards().query("city == @city").reset_index(drop=True)
-    daily, stale = fetch_daily_weather(cw["latitude"].mean(), cw["longitude"].mean(), date.fromisoformat(today_iso))
-    X = pd.concat(
-        [build_features(daily, {c: r[c] for c in STATIC_COLS}) for _, r in cw.iterrows()], ignore_index=True
-    )
+    if today_iso in recorded_starts():               # recorded data: each ward's own saved weather for that week (works offline)
+        dm = load_recorded()
+        dm = dm[(dm["date"] == pd.Timestamp(today_iso) - pd.Timedelta(days=7)) & (dm["city"] == city)]
+        X = cw[["ward_id"]].merge(dm, on="ward_id", how="left").drop(columns=["ward_id", "date", "city"])
+        X = pd.concat([X, cw[STATIC_COLS]], axis=1)
+        daily, stale = pd.DataFrame(), False
+    else:
+        daily, stale = fetch_daily_weather(cw["latitude"].mean(), cw["longitude"].mean(), date.fromisoformat(today_iso))
+        X = pd.concat(
+            [build_features(daily, {c: r[c] for c in STATIC_COLS}) for _, r in cw.iterrows()], ignore_index=True
+        )
     fc = forecast_weeks(X)
     fc = fc.merge(cw[["ward_no", "ward_id", "latitude", "longitude"] + STATIC_COLS], left_on="row", right_index=True)
     return fc, X, daily, stale
@@ -137,6 +157,10 @@ def driver_sentence(df: pd.DataFrame) -> str:
 # ----------------------------------------------------------------------------- header
 wards = load_wards()
 today = datetime.now(ZoneInfo("Asia/Dhaka")).date()
+SRC_LIVE, SRC_REC = "📡 Live weather", "🗂️ Recorded data (2025)"
+rec_on = st.session_state.get("src_mode") == SRC_REC
+if rec_on:                                          # recorded mode: the officer picks the week; no internet needed
+    today = date.fromisoformat(st.session_state.get("rec_date", "2025-08-25"))
 end_day = today + timedelta(days=27)
 
 st.image(str(ROOT / "assets" / "banner.png"), width="stretch")
@@ -152,7 +176,7 @@ with st.sidebar:
     city = st.selectbox("City corporation", sorted(wards["city"].unique()), key="city")
     ward_options = sorted(wards.loc[wards["city"] == city, "ward_no"])
     ward_no = st.selectbox("Ward number", ward_options, key="ward")
-    st.caption(f"📅 Today: **{today:%A, %d %B %Y}**")
+    st.caption(f"📅 {'Forecast from' if rec_on else 'Today'}: **{today:%A, %d %B %Y}**")
 
     sel = wards[(wards["city"] == city) & (wards["ward_no"] == ward_no)].iloc[0]
     st.markdown("**Ward vulnerability (fixed)**")
@@ -162,9 +186,17 @@ with st.sidebar:
                 text=f"Crowding: {sel['population_density_sqkm']:,.0f} per sq km")
 
     st.header("2. Check the forecast")
+    st.radio("Weather source", [SRC_LIVE, SRC_REC], key="src_mode",
+             help="Recorded data replays last year's real weather for every ward, with no internet needed.")
+    if rec_on:
+        opts = recorded_starts()
+        st.select_slider("Forecast starting", opts, value="2025-08-25", key="rec_date",
+                         format_func=lambda d: f"{date.fromisoformat(d):%d %b %Y}")
+        st.caption("Scroll the date to see the forecast for any week of 2025. Works fully offline.")
     if st.button("Check dengue risk", type="primary", width="stretch"):
         st.session_state["checked"] = (city, int(ward_no))
-    st.caption("Live weather from Open-Meteo. Results are cached for the day, so repeat checks are instant.")
+    if not rec_on:
+        st.caption("Live weather from Open-Meteo. Results are cached for the day, so repeat checks are instant.")
 
 checked = st.session_state.get("checked")
 
@@ -201,8 +233,8 @@ peak_tier = max(wf["risk"], key=RANK.get)
 peak_week = int(wf.loc[wf["risk"].map(RANK).idxmax(), "week"])
 x = X_all.loc[[int(wf["row"].iloc[0])]]
 
-tab_risk, tab_drivers, tab_map, tab_about = st.tabs(
-    ["🎯 4-week forecast and actions", "🌧️ Weather drivers", "🗺️ Ward map", "ℹ️ How it works"]
+tab_risk, tab_drivers, tab_map, tab_alloc, tab_beds, tab_sim, tab_about = st.tabs(
+    ["🎯 4-week forecast and actions", "🌧️ Weather drivers", "🗺️ Ward map", "📦 Supply allocation", "🏥 Bed overflow", "🦟 What-if: vector control", "ℹ️ How it works"]
 )
 
 # ---- Tab 1: weekly forecast + supplies + actions
@@ -345,7 +377,252 @@ with tab_map:
     st.caption("Week columns show expected cases. All wards in a city share the same weather (fetched once per city); "
                "they differ by their fixed vulnerability.")
 
-# ---- Tab 4: about
+# ---- Tab 4: supply allocation for the whole city, next week only
+with tab_alloc:
+    d1, d2 = week_dates(1, today)
+    dem = build_ward_demand(fc[fc["week"] == 1])
+    need_s, need_k, need_c = int(dem["saline_need"].sum()), int(dem["kits_need"].sum()), int(dem["crews_need"].sum())
+    st.subheader(f"Next week's supply allocation for all {len(dem)} wards in {c_city}")
+    st.caption(f"Forecast week: {d1:%d %b} to {d2:%d %b}. Enter what you have for that week; the tool shares it across wards and tells you what to order.")
+
+    mode = st.radio("Enter stock as", ["Percent of next week's need", "Exact numbers"], horizontal=True, key="alloc_mode")
+    k1, k2 = st.columns(2)
+    if mode.startswith("Percent"):
+        pct = k1.slider("Available regional stock (% of next week's need)", 30, 100, 60, 5, key="stock_pct")
+        saline_stock, kits_stock = int(round(need_s * pct / 100)), int(round(need_k * pct / 100))
+        k2.markdown(f"**Saline bags in stock:** {saline_stock:,} (need {need_s:,})  \n**Test kits in stock:** {kits_stock:,} (need {need_k:,})")
+    else:
+        saline_stock = int(k1.number_input("Saline bags in stock", 0, 10_000_000, int(need_s * 0.6), key=f"sal_{c_city}_{need_s}"))
+        kits_stock = int(k2.number_input("Test kits in stock", 0, 10_000_000, int(need_k * 0.6), key=f"kit_{c_city}_{need_k}"))
+    crews_total = int(st.number_input(f"Total spraying crews available (next week calls for {need_c})", 0, 100_000,
+                                      int(round(need_c * 0.6)), key=f"crew_{c_city}_{need_c}"))
+
+    res, sm = run_allocation(dem, saline_stock, kits_stock, crews_total)
+
+    if sm["with_demand"] == 0:
+        st.success("The forecast shows almost no demand next week, so there is nothing to allocate or order.")
+    else:
+        st.markdown("**📝 To order for next week**")
+        m = st.columns(3)
+        for col, (name, key) in zip(m, [("Saline bags", "saline"), ("Test kits", "kits"), ("Spraying crews", "crews")]):
+            d = sm[key]
+            col.metric(name, f"{d['short']:,} to order" if d["short"] else "Nothing to order",
+                       f"have {d['stock']:,} of {d['need']:,} needed", delta_color="off")
+
+        nb = sm["by_band"]
+        crit = res[res["worst_band"] == 3]
+        if len(crit):
+            names = ", ".join(f"Ward {w}" for w in crit["ward_no"].head(8)) + (" ..." if len(crit) > 8 else "")
+            st.error(f"🔴 CRITICAL SUPPLY DEFICIT in {len(crit)} ward(s): {names}. More than half of their need cannot be met with current stock.")
+        if nb["Serious shortfall"]:
+            st.warning(f"🟠 {nb['Serious shortfall']} ward(s) have a serious shortfall (26-50% unmet).")
+        if nb["Minor shortfall"]:
+            st.info(f"🟡 {nb['Minor shortfall']} ward(s) have a minor shortfall (up to 25% unmet).")
+        if nb["Fully covered"] == sm["wards"]:
+            st.success("🟢 Every ward's need is fully covered.")
+        left = [f"{sm[k]['surplus']:,} {n}" for k, n in (("saline", "saline bags"), ("kits", "kits"), ("crews", "crews")) if sm[k]["surplus"]]
+        if left:
+            st.caption("Stock not needed next week: " + ", ".join(left))
+
+        top = res.head(25).sort_values("rank", ascending=False)
+        cov = (1 - top["worst_short_pct"]) * 100
+        band_color = ["#2e9e5b", "#e2b714", "#e8833a", "#c0392b"]
+        fig = go.Figure(go.Bar(
+            x=cov, y=[f"#{r} Ward {w}" for r, w in zip(top["rank"], top["ward_no"])], orientation="h",
+            marker_color=[band_color[b] for b in top["worst_band"]],
+            text=[f"{c:.0f}%" for c in cov], textposition="outside"))
+        fig.update_layout(title="Coverage of the worst-supplied item, top 25 priority wards", height=60 + 22 * len(top),
+                          xaxis=dict(range=[0, 110], title="% of need met"), margin=dict(l=10, r=10, t=40, b=10))
+        st.plotly_chart(fig, width="stretch")
+
+    show = pd.DataFrame({
+        "Priority": res["rank"], "Ward": res["ward_no"], "Risk": res["peak_risk"],
+        "Expected cases": res["cases_4wk"].round(1), "People per sq km": res["density"].round(0).astype(int),
+        "Saline": res["saline_given"].astype(str) + " / " + res["saline_need"].astype(str),
+        "Kits": res["kits_given"].astype(str) + " / " + res["kits_need"].astype(str),
+        "Crews": res["crews_given"].astype(str) + " / " + res["crews_need"].astype(str),
+        "Beds needed": res["beds_need"], "Status": res["status"]})
+    st.dataframe(show, hide_index=True, width="stretch")
+    st.caption("Supply columns read: given / needed. Anything not given is the shortfall to order.")
+    st.download_button("⬇️ Download allocation (CSV)", show.to_csv(index=False).encode("utf-8"),
+                       file_name=f"allocation_{c_city}_{today}.csv", mime="text/csv")
+
+    with st.expander("How this allocation works (assumptions)"):
+        st.markdown(f"""
+- **Need** per ward = next week's forecast (saline, kits, beds). Crew need follows the ward's risk tier:
+  Low {CREWS_BY_TIER['Low']}, Medium {CREWS_BY_TIER['Medium']}, High {CREWS_BY_TIER['High']}, Critical {CREWS_BY_TIER['Critical']} crews (an assumption: the dataset has no crew data).
+- **Priority** = {W_CASES:.0%} expected cases (relative to the city's busiest ward) + {W_DENSITY:.0%} population density (relative to the densest ward).
+- **Sharing:** stock goes out in rounds of up to {ROUND_SHARE:.0%} of each ward's need. If stock cannot cover everyone's first {ROUND_SHARE:.0%},
+  it is split across all wards by priority and need, so no ward gets zero. The second round goes strictly in priority order.
+- **Crews** are whole units: every ward that needs one gets a first crew (by priority) before any ward gets a second.
+- **Flags** use the share of need left unmet, taking each ward's worst item: 🟢 0%, 🟡 up to 25%, 🟠 26-50%, 🔴 over 50%.
+- **To order** = total need minus stock, for saline, kits and crews.
+- Hospital beds are not stock-limited here; bed capacity and overflow between hospitals are handled separately.""")
+
+# ---- Tab 5: hospital surge and overflow routing (next week, same city only)
+with tab_beds:
+    b1, b2 = week_dates(1, today)
+    geo = fc[fc["week"] == 1][["ward_no", "latitude", "longitude"]]
+    bw = dem.merge(geo, on="ward_no")                       # `dem` = next week's ward demand from the allocation tab
+    st.subheader(f"Hospital beds and overflow for {c_city}")
+    st.caption(f"Forecast week: {b1:%d %b} to {b2:%d %b}. Wards that need more beds than they have are listed with where to send the overflow.")
+
+    free = st.slider("Share of dengue beds currently free", 30, 100, 50, 5, key="bed_free",
+                     help="Hospitals are never empty. This is the part of each ward's dengue-designated beds that is available.")
+    with st.expander("Bed capacity assumption (can be changed)"):
+        per10k = st.number_input("Dengue-designated beds per 10,000 people per sq km of density", 0.1, 10.0, float(BEDS_PER_10K), 0.1,
+                                 key="bed_per10k")
+        st.caption("The dataset has no hospital capacity, so each ward's beds = density / 10,000 x this number x the free share (at least 1).")
+
+    bt, rt, bs = plan_overflow(bw, free / 100, per10k)
+
+    if bs["need"] == 0:
+        st.success("The forecast shows no bed demand next week, so there is no overflow to route.")
+    else:
+        m = st.columns(4)
+        m[0].metric("Beds needed", f"{bs['need']:,}")
+        m[1].metric("Beds available", f"{bs['capacity']:,}")
+        m[2].metric("City bed utilization", f"{bs['utilization']:.0%}")
+        m[3].metric("Wards in surge", bs["surge_wards"])
+        st.progress(min(bs["utilization"], 1.0))
+
+        if bs["surge_wards"] == 0:
+            st.success("🟢 Every ward can handle its own patients next week. No rerouting needed.")
+        else:
+            if bs["unplaced"]:
+                st.error(f"🔴 CITY-WIDE BED SHORTAGE: {bs['unplaced']} patient(s) cannot be placed anywhere in {c_city}. "
+                         "Ask for beds from outside the city or open extra capacity.")
+            if bs["rerouted"]:
+                st.warning(f"🟠 {bs['surge_wards']} ward(s) are over capacity. {bs['rerouted']} bed(s) of overflow can be rerouted within the city.")
+            if len(rt):
+                st.markdown("**📞 Call these wards**")
+                for _, a in rt.iterrows():
+                    st.markdown(f"- **Ward {a.from_ward}** is over capacity: send **{a.beds} patient(s)** to **Ward {a.to_ward}** ({a.km} km away)")
+                st.dataframe(rt.rename(columns={"from_ward": "From ward", "to_ward": "To ward", "beds": "Beds", "km": "Distance (km)"}),
+                             hide_index=True, width="stretch")
+                st.download_button("⬇️ Download routes (CSV)", rt.to_csv(index=False).encode("utf-8"),
+                                   file_name=f"overflow_routes_{c_city}_{today}.csv", mime="text/csv")
+
+        srt = bt.sort_values("net")
+        topn = srt.head(25).sort_values("net", ascending=False)
+        fig = go.Figure(go.Bar(
+            x=topn["net"], y=[f"Ward {w}" for w in topn["ward_no"]], orientation="h",
+            marker_color=["#c0392b" if v < 0 else "#2e9e5b" for v in topn["net"]]))
+        fig.update_layout(title="Net beds per ward (spare + / deficit -), 25 tightest wards", height=60 + 22 * len(topn),
+                          xaxis_title="Beds", margin=dict(l=10, r=10, t=40, b=10))
+        st.plotly_chart(fig, width="stretch")
+
+        st.dataframe(pd.DataFrame({
+            "Ward": srt["ward_no"], "Beds needed": srt["need"], "Beds available": srt["capacity"],
+            "Net (+spare / -deficit)": srt["net"], "Utilization": (srt["utilization"] * 100).round(0).astype(int).astype(str) + "%",
+            "Sends out": srt["rerouted"], "Receives": srt["received"], "Status": srt["status"]}),
+            hide_index=True, width="stretch")
+
+    with st.expander("How the routing works (assumptions)"):
+        st.markdown("""
+- **Beds needed** = next week's forecast for each ward. **Beds available** is an assumption (the dataset has no capacity): density-based, scaled by the free share above.
+- **Surge** = a ward needs more beds than it has. The gap is its overflow.
+- **Routing:** the biggest overflow is placed first, each time into the nearest ward (by map coordinates) that still has spare beds. A ward never takes more than its spare beds.
+- **Same city only.** If the whole city is full, the tool reports a city-wide shortage instead of hiding it.
+- The tool suggests; the officer decides and calls the hospitals. No patient data is used.""")
+
+# ---- Tab 6: what-if vector control simulator
+with tab_sim:
+    st.subheader(f"What-if: send spraying crews in {c_city}")
+    st.caption("Choose how many crews work, for how many days, and where. The forecast model is re-run for each ward with fewer "
+               "breeding sites. Crews work during next week, so week 1 stays as forecast and you see the effect on weeks 2 to 4: cases, beds and saline with and without the crews.")
+
+    s1, s2, s3 = st.columns(3)
+    sim_total = int(s1.number_input("Crews available", 0, 1000, max(int(crews_total), 1), key=f"sim_crews_{c_city}"))
+    sim_days = int(s2.slider("Days each crew works", 1, 14, 5, key="sim_days",
+                             help="Larvicide and fogging rounds repeated over this many days."))
+    sim_eff = s3.slider("Effect of one crew for one day (%)", 2, 10, int(EFFECT_PER_CREW_DAY * 100), key="sim_eff",
+                        help="Assumption: the dataset has no spraying data, so the officer can test other values.") / 100
+
+    base_rows = X_all.index
+    cases_by_k = ward_curves(X_all, sim_days, sim_eff)                  # 4-week cases per ward for 0..5 crews
+    gain1 = cases_by_k[0] - cases_by_k[1]                               # cases prevented by ONE crew in each ward
+    ward_of_row = fc[fc["week"] == 1].set_index("row")["ward_no"].reindex(base_rows).to_numpy()
+    dens_of_row = fc[fc["week"] == 1].set_index("row")["population_density_sqkm"].reindex(base_rows).to_numpy()
+
+    mode_s = st.radio("Deployment", ["Auto: best wards first", "Manual: I choose the wards"], horizontal=True, key="sim_mode")
+    if mode_s.startswith("Auto"):
+        crews_vec = auto_deploy(cases_by_k, sim_total)
+    else:
+        order = np.argsort(-gain1)
+        default_pick = [int(ward_of_row[i]) for i in order[:3] if gain1[i] > 0]
+        pick = st.multiselect("Wards to send crews to", sorted(int(w) for w in ward_of_row), default=default_pick, key=f"sim_pick_{c_city}")
+        each = int(st.number_input("Crews per selected ward", 1, MAX_CREWS_PER_WARD, 1, key="sim_each"))
+        crews_vec = np.array([each if int(w) in pick else 0 for w in ward_of_row])
+        if crews_vec.sum() > sim_total:
+            st.error(f"You selected {int(crews_vec.sum())} crews but only {sim_total} are available. Remove wards or lower the crews per ward.")
+
+    base = run_whatif(X_all, np.zeros(len(X_all), int), sim_days, sim_eff)
+    what = run_whatif(X_all, crews_vec, sim_days, sim_eff)
+
+    def city_week(f, col):
+        return f.groupby("week")[col].sum()
+
+    cb, cw_ = city_week(base, "predicted_cases"), city_week(what, "predicted_cases")
+    prevented = float(cb.sum() - cw_.sum())
+    later = cb.loc[2:].sum()                                         # weeks 2-4: the weeks the crews can still change
+    b2, w2 = base[base["week"] > 1], what[what["week"] > 1]        # weeks 2-4: the weeks the crews can still change
+    bed_b, bed_w = int(city_week(b2, "hospital_beds").max()), int(city_week(w2, "hospital_beds").max())
+    sal_b, sal_w = int(b2["saline_bags"].sum()), int(w2["saline_bags"].sum())
+
+    if crews_vec.sum() == 0 or later < 0.5:
+        st.info("Either no crews are deployed or the forecast shows almost no cases, so there is nothing to prevent. "
+                "Try a week in the dengue season.")
+    else:
+        m = st.columns(4)
+        m[0].metric("Crews deployed", f"{int(crews_vec.sum())} of {sim_total}")
+        m[1].metric("Cases prevented (weeks 2-4)", f"{prevented:,.1f}", f"-{prevented / later:.0%} of {later:,.0f}", delta_color="inverse")
+        m[2].metric("Peak beds freed (weeks 2-4)", f"{bed_b - bed_w:,}", f"{bed_b} to {bed_w}", delta_color="off")
+        m[3].metric("Saline bags saved (weeks 2-4)", f"{sal_b - sal_w:,}", f"{sal_b:,} to {sal_w:,}", delta_color="off")
+        st.metric("Cases prevented per crew (ROI)", f"{prevented / crews_vec.sum():.2f}")
+
+        wk = [f"Week {k} ({week_dates(k, today)[0]:%d %b})" for k in cb.index]
+        fig = go.Figure([go.Bar(name="Without crews", x=wk, y=cb.round(1), marker_color="#c0392b"),
+                         go.Bar(name="With crews", x=wk, y=cw_.round(1), marker_color="#2e9e5b")])
+        fig.update_layout(barmode="group", title="Expected cases in the whole city, per week", yaxis_title="Cases",
+                          height=330, margin=dict(l=10, r=10, t=40, b=10))
+        st.plotly_chart(fig, width="stretch")
+        st.caption("Crews work during week 1, so week 1 is unchanged. Weeks 2 to 4 are separate runs of the forecast model, so you can see how the effect builds.")
+
+    # ROI ranking: what ONE crew would prevent in each ward, and what the chosen deployment prevents
+    bw = base.groupby("row").agg(b_cases=("predicted_cases", "sum"))
+    bw = bw.join(b2.groupby("row").agg(b_beds=("hospital_beds", "max"), b_sal=("saline_bags", "sum")))
+    ww = what.groupby("row").agg(w_cases=("predicted_cases", "sum"))
+    ww = ww.join(w2.groupby("row").agg(w_beds=("hospital_beds", "max"), w_sal=("saline_bags", "sum")))
+    t = bw.join(ww).reindex(base_rows)
+    t["ward"], t["crews"], t["density"], t["one_crew"] = ward_of_row, crews_vec, dens_of_row, gain1
+    t["prevented"] = t["b_cases"] - t["w_cases"]
+    t = t.sort_values(["one_crew", "density"], ascending=False).reset_index(drop=True)
+    out = pd.DataFrame({
+        "ROI rank": np.arange(1, len(t) + 1), "Ward": t["ward"], "Cases without crews (4 wks)": t["b_cases"].round(1),
+        "Prevented by 1 crew": t["one_crew"].round(2),
+        "Crews sent": t["crews"], "Cases prevented (as deployed)": t["prevented"].round(2),
+        "Per crew": np.where(t["crews"] > 0, t["prevented"] / t["crews"].where(t["crews"] > 0, 1), 0.0).round(2),
+        "Beds freed (wks 2-4)": (t["b_beds"] - t["w_beds"]).astype(int), "Saline saved (wks 2-4)": (t["b_sal"] - t["w_sal"]).astype(int)})
+    st.markdown("**Wards ranked by ROI (cases prevented per crew)**")
+    st.dataframe(out, hide_index=True, width="stretch")
+    st.download_button("⬇️ Download simulation (CSV)", out.to_csv(index=False).encode("utf-8"),
+                       file_name=f"vector_control_{c_city}_{today}.csv", mime="text/csv")
+
+    with st.expander("How the simulation works (assumptions)"):
+        st.markdown(f"""
+- **No new model.** The same 4 weekly forecast models are run again with a change to the ward's inputs. Everything the model does with that
+  change comes from 10 years of ward data.
+- **What a crew changes (assumption).** The dataset has no spraying records. We assume one crew working one day cuts the ward's effective
+  water-logging risk (the stagnant-water breeding sites) by {sim_eff:.0%}, with diminishing returns: reduction = 1 - (1 - {sim_eff:.2f})^(crews x days).
+  So {sim_days} days with 1 crew = **{(1 - (1 - sim_eff) ** sim_days):.0%}**, with 2 crews = **{(1 - (1 - sim_eff) ** (2 * sim_days)):.0%}**. Change the slider to test other values.
+- **Timing.** Crews work during next week (week 1), and we cannot change what happens before they arrive. So week 1 stays as forecast and the effect is applied to weeks 2, 3 and 4. The model decides how large it is in each of those weeks.
+- **Beds and saline** come from the same cases-to-supplies table as the rest of the app, so they move in whole steps.
+- **ROI** = cases prevented divided by crews sent. "Cases prevented by 1 crew" ranks every ward on equal terms; Auto mode adds crews one at a
+  time where the next crew prevents the most cases.
+- Results are model estimates for planning, not guarantees.""")
+
+# ---- Tab 7: about
 with tab_about:
     st.image(str(ROOT / "assets" / "breeding_clock.png"), width="stretch")
     st.markdown(
