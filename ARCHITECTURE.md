@@ -1,142 +1,135 @@
-# Architecture: Dengue Outbreak Early Warning
+ARCHITECTURE: DENGUE OUTBREAK EARLY WARNING
 
-A weather-driven classifier that gives each ward a **Low / Medium / High / Critical** risk tier for the **next 28 days**, with a recommended action. The model is trained offline on 10 years of weekly ward data and serves predictions in a Streamlit app using live weather from Open-Meteo.
+A decision-support tool for public health officers in Bangladesh. It forecasts dengue cases for every ward for the next 4 weeks, turns the forecast into supplies, beds and spraying crews, shares limited stock fairly, and produces send-ready notices.
 
-## 1. Data flow
-
-```text
-OFFLINE TRAINING (Colab / src/train.py)
-
-+--------------------------------------------------------+
-| Raw dataset: 31,320 weekly rows, 60 wards, 2016-2025   |
-+--------------------------------------------------------+
-                             |
-                             v
-+--------------------------------------------------------+
-| Preprocess: drop max/min temp, build per-ward lags     |
-+--------------------------------------------------------+
-                             |
-                             v
-+--------------------------------------------------------+
-| Target: dengue cases in the next 4 weeks,              |
-| split into Low / Medium / High / Critical              |
-+--------------------------------------------------------+
-                             |
-                             v
-+--------------------------------------------------------+
-| Chronological split:                                   |
-| train 2016-2023, test 2024-2025                        |
-+--------------------------------------------------------+
-                             |
-                             v
-+--------------------------------------------------------+
-| HistGradientBoosting (balanced class weights)          |
-+--------------------------------------------------------+
-                             |
-                             v
-+--------------------------------------------------------+
-| Saved model: models/dengue_model.joblib                |
-+--------------------------------------------------------+
+Live app: https://hackathon1-wpmz8tfch8ug5bgb39itin.streamlit.app/
+Coverage: 60 wards in 5 city corporations (Chattogram, Dhaka North, Dhaka South, Gazipur, Narayanganj)
 
 
-ONLINE PREDICTION (Streamlit app)
+1. SYSTEM OVERVIEW
 
-+--------------------------------------------------------+
-| User picks city + ward (date = today)                  |
-+--------------------------------------------------------+
-                             |
-                             v
-+--------------------------------------------------------+
-| data/ward_static.csv: lat/lon + 3 fixed ward features  |
-+--------------------------------------------------------+
-                             |
-                             v
-+--------------------------------------------------------+
-| Open-Meteo API: last 35 completed days                 |
-+--------------------------------------------------------+
-                             |
-                             v
-+--------------------------------------------------------+
-| Disk cache: 1 API call per location per day            |
-+--------------------------------------------------------+
-                             |
-                             v
-+--------------------------------------------------------+
-| Weekly features: rainfall x5 weeks,                    |
-| temperature and humidity x2 weeks                      |
-+--------------------------------------------------------+
-                             |
-                             v
-+--------------------------------------------------------+
-| Load saved model once, then predict                    |
-+--------------------------------------------------------+
-                             |
-                             v
-+--------------------------------------------------------+
-| Risk tier + probabilities + recommended action         |
-+--------------------------------------------------------+
-```
+Pipeline, in order:
+1. Open-Meteo weather, or recorded 2025 data
+2. features.py - 14 model inputs
+3. ward_static.csv - density, water-logging, sanitation
+4. predict.py - 4 weekly models
+5. cases_to_supplies.csv - saline, kits, beds
+6. allocation.py - shares limited stock
+7. overflow.py - bed surge routing
+8. explain.py - why this forecast
+9. simulate.py - what-if spraying crews
+10. dispatch.py - SMS, WhatsApp, HTML, PDF
+11. dashboard.py + ui.py - Streamlit app
+12. exports/ - sample notices and briefs
 
-**Live feature construction.** Only completed days are used (yesterday and earlier). Week 0 is the last 7 days, week 1 the 7 days before, up to week 4. Rainfall is summed per week; temperature and humidity are averaged. Inputs to the model (12 features):
+The whole pipeline runs offline after the model and data files are loaded. The only network call is one weather request per city per day.
 
-| Group | Features |
-|---|---|
-| Ward (fixed, looked up) | `population_density_sqkm`, `water_logging_risk_index`, `sanitation_score` |
-| Current week | `rainfall_mm`, `avg_temp_c`, `relative_humidity_pct` |
-| Lags | `rainfall_mm_lag1w` to `lag4w`, `avg_temp_c_lag1w`, `relative_humidity_pct_lag1w` |
 
-Lags are computed per `ward_id`, so one ward's history never leaks into another. This matches the 2-to-4-week mosquito breeding and incubation delay: rainfall 2 to 4 weeks back was the strongest predictor.
+2. DATA FLOW, STEP BY STEP
 
-## 2. Target and risk tiers
+1. Weather in. weather.py fetches the last 35 completed days of rain, temperature and humidity from Open-Meteo for the city centre. Results are cached on disk per location and day, retried 3 times, and fall back to the last good file if the service is down. In Recorded data mode the app replays each ward's own saved 2025 weather and needs no internet.
 
-The target is the **sum of dengue cases in the next 4 weeks** (t+1 to t+4) per ward. Tier cutoffs are the 50th, 75th and 90th percentiles of the training years only, so no test information is used:
+2. Features. features.py builds 14 inputs per ward: weekly rainfall now and 1 to 4 weeks ago, temperature and humidity now and 1 week ago, week-of-year as sine and cosine, plus the ward's 3 fixed traits (population density, water-logging risk, sanitation score).
 
-| Tier | Cases in next 4 weeks | Share of rows |
-|---|---|---|
-| Low | 0-1 | about 50% |
-| Medium | 2-19 | about 26% |
-| High | 20-37 | about 15% |
-| Critical | 38 or more | about 9% |
+3. Forecast. predict.py loads one saved gradient-boosting model per forecast week (weeks 1 to 4) and predicts expected cases for each ward and week.
 
-Critical is deliberately rare and occurs only in June-September, so it works as an alarm. The first 4 and last 4 weeks of each ward are dropped (no lags or no future), leaving 30,840 rows.
+4. Risk tier. Weekly cases map to Low (0 to 1), Medium (2 to 6), High (7 to 11) or Critical (12 or more).
 
-## 3. Chronological validation split
+5. Supplies. Expected cases are converted to saline bags, test kits and hospital beds with the dataset's own cases_to_supplies.csv lookup table.
 
-- **Final split:** train on 2016-2023 (about 24,800 rows), test on 2024-2025 (6,060 rows). The model never sees later weeks than it is tested on, which mirrors real use: forecasting the future.
-- **Expanding-window validation:** for each test year 2020-2025, train on all earlier years. Macro-F1 ranged from 0.69 to 0.76 (mean 0.72), so performance is stable across years.
-- **Why not a random split:** the target for week t overlaps heavily with weeks t+1 to t+3 of the same ward, so a random split puts near-duplicates in both sets. It scored accuracy 0.854 / macro-F1 0.805, against 0.779 / 0.689 on the chronological split. We report the chronological numbers.
-- The saved model is refit on all years after validation.
+6. Allocation (week 1). allocation.py shares the officer's weekly stock across wards (rules in section 4).
 
-## 4. Model selection
+7. Bed overflow (week 1). overflow.py finds wards that need more beds than they have and routes the overflow to the nearest ward with room, in the same city.
 
-All models used the same 12 features and the same chronological split (test 2024-2025):
+8. Dispatch. dispatch.py fills fixed templates from the allocation and overflow results. No LLM and no external API is involved.
 
-| Model | Accuracy | Macro-F1 | Critical recall | Saved size |
-|---|---|---|---|---|
-| Logistic regression | 0.781 | 0.675 | 51% | under 0.01 MB |
-| Random forest (balanced) | 0.787 | 0.699 | 66% | about 15-95 MB |
-| **HistGradientBoosting (balanced)** | 0.779 | 0.689 | 65% | **about 2 MB** |
+9. Explain and simulate. explain.py shows what drives a forecast; simulate.py shows what spraying crews would change.
 
-**Chosen: HistGradientBoostingClassifier with balanced class weights.** Random forest and gradient boosting are statistically tied on accuracy and macro-F1 (each wins in 3 of 6 validation years). Gradient boosting was chosen for **size and speed**: a file of about 2 MB loads instantly, is safe to commit to GitHub, and predicts a single row in about 4 ms. It handles non-linear weather interactions (for example, the effect of rainfall depends on ward water-logging) that logistic regression misses, and needs no feature scaling. Balanced class weights raise recall on the rare High and Critical tiers, where a missed outbreak is costliest. 99.5% of predictions are within one tier of the truth; most errors are between neighbouring tiers, and the model tends to over-warn rather than under-warn.
 
-Features dropped: `max_temp_c` and `min_temp_c` (correlation about 0.97 with `avg_temp_c`; removing them cost about 2.5% error). Ward features were kept: they separate high- and low-vulnerability wards (water-logging has the strongest ward-level link to cases).
+3. MODULES
 
-## 5. Efficiency and cost controls
+- app/dashboard.py: Streamlit app: sidebar inputs, 9 tabs, all charts and tables
+- src/ui.py: Theme, animated mosquito hero, city overview charts
+- src/weather.py: Open-Meteo client with daily cache, retries and stale fallback
+- src/features.py: Builds the 14 model inputs from 35 days of weather
+- src/predict.py: Loads the 4 models, forecasts, tiers, supplies lookup
+- src/explain.py: Exact Shapley values over 11 factor groups (2,048 what-if runs, about 50 ms)
+- src/allocation.py: Priority scoring, round-based stock sharing, crews, shortfall bands
+- src/overflow.py: Ward bed capacity, surge detection, nearest-room routing
+- src/simulate.py: Counterfactual forecasts with fewer breeding sites, ROI per crew
+- src/dispatch.py: SMS (160-char parts), WhatsApp text, HTML brief, PDF brief
+- scripts/make_exports.py: Regenerates the files in exports/ with the real pipeline
+- models/dengue_weekly_models.joblib: Saved models, feature order, labels, tier cut-offs
+- data/: ward_static.csv, cases_to_supplies.csv, recorded_2025.csv
 
-- **No LLM or paid API at inference, so token cost is zero.** The only external call is the free Open-Meteo weather API.
-- **API minimisation:** results are cached on disk per (location, date), so at most 1 call per location per day, and repeated predictions make none. Coordinates are rounded to 2 decimals so neighbouring wards share a cache entry.
-- **One request returns everything:** daily temperature and rainfall plus hourly humidity for 35 days in a single call.
-- **Fast inference:** the serialized model is loaded once per process, and feature construction is a few vectorised operations.
 
-## 6. Resilience
+4. KEY DESIGN DECISIONS
 
-- Requests use a 10-second timeout and 3 retries with exponential backoff (1 s, 2 s, 4 s).
-- If the API is down, the app falls back to the most recent cached data for that location and shows a clear "stale data" warning. If none exists, it shows an error instead of guessing.
-- Weather data is validated before use (35 complete days, no missing values).
-- The model's feature order is stored with the model, and probabilities are re-ordered Low to Critical, because scikit-learn returns classes alphabetically.
+- One model per forecast week, not one model rolled forward. Each model predicts its own week directly, so errors do not compound. Later weeks are less accurate because part of the rain that drives them has not fallen yet, and the app says so.
 
-## 7. Limitations
+- Lagged weather. Mosquito eggs need 7 to 14 days to mature and the virus then needs time to incubate, so cases follow rain by 2 to 4 weeks. The models read 5 weekly rainfall totals.
 
-- The output is one tier for the whole 28-day window (the model's target), not a day-by-day forecast.
-- The dataset is treated as weekly aggregates (rainfall summed, temperature and humidity averaged); live data is aggregated the same way, but the dataset's week alignment is undocumented.
-- Training weather varies per ward, while the live API supplies location-level grid values; this is a small mismatch.
+- Fair, explainable allocation. Priority is 70% predicted cases and 30% population density. Stock goes out in rounds of up to 50% of each ward's need. If round 1 cannot cover everyone, stock is shared across all wards in proportion to priority and need, so no ward is left at zero. Spraying crews are whole units handed out one level at a time in priority order (Low 0, Medium 1, High 2, Critical 3). Every shortfall is flagged: Minor (up to 25%), Serious (up to 50%), Critical deficit (above 50%).
+
+- Honest overflow. Overflow that no ward in the city can absorb is reported as a city-wide shortage, not hidden.
+
+- Offline notices. Messages come from fixed templates, so they are deterministic, free to run and safe from invented content. SMS text is plain ASCII.
+
+- Cheap to run. One weather request per city per day, models loaded once, no paid API at runtime.
+
+
+5. ASSUMPTIONS AND LIMITS
+
+- Bed capacity is not in the dataset. Assumed: beds in a ward = density / 10,000 x 1.0 x share currently free (at least 1). The officer can change both numbers.
+
+- Spraying effect is not in the dataset. Assumed: one crew-day cuts effective water-logging risk by 6%, with diminishing returns. The officer can change it.
+
+- Weather is per city, not per ward, in live mode. Wards differ by their fixed traits.
+
+- Planning estimates only. The tool does not diagnose illness or replace local surveillance data. The officer confirms numbers and calls the facilities.
+
+- Sending is not automated. The app prepares send-ready text; delivery needs the officer's phone or a GSM gateway.
+
+- Access. The current deployed build has no login. Firebase login for officers was chosen as the access method and is the next step.
+
+
+6. DEPLOYMENT
+
+- Hosted on Streamlit Community Cloud from the main branch; main file app/dashboard.py.
+- Dependencies in requirements.txt (scikit-learn pinned to the training version so the saved model loads).
+- Every push to main redeploys automatically.
+- The weather cache is ephemeral on Streamlit Cloud; Recorded data mode is the backup if the weather service is slow.
+
+
+7. EXPORTS (/exports)
+
+Generated by python scripts/make_exports.py from the real pipeline using recorded 2025 weather (default city Chattogram, forecast week from 25 Aug 2025, stock at 60% of need).
+
+- sms_notices.txt: One SMS per ward, split into 160-character parts where needed
+- whatsapp_notices.txt: Longer formatted notices ready to paste into WhatsApp
+- commissioner_brief.html: Printable brief: city totals, deficit alerts, ward table, bed routes
+- commissioner_brief.pdf: The same brief as a PDF
+
+
+8. REPOSITORY LAYOUT
+
+app/dashboard.py     src/*.py     scripts/make_exports.py
+models/              data/        assets/        exports/
+.streamlit/config.toml            requirements.txt
+ARCHITECTURE.md
+
+
+9. VERSION CONTROL
+
+Each commit message starts with "version-onsite-final:" followed by a short description of that one change, so the history reads as a continuous log of the onsite work.
+
+
+10. AI DISCLOSURE
+
+- Tool used: Claude (Anthropic), as a development assistant.
+
+- What it helped with: planning the approach (preprocessing, lag features, risk tiers, model choice), reviewing and writing code, the dashboard look and feel and the mosquito hero animation (src/ui.py), deployment guidance, and this document.
+
+- What it did not do: it is not used at runtime. The deployed app has no LLM calls, no AI-token API and no generated text; forecasts come from the saved scikit-learn models and all notices come from fixed templates.
+
+- Human responsibility: the team chose the data, the assumptions in section 5 and the allocation rules, ran and checked the code, and is responsible fo
